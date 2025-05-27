@@ -56,6 +56,55 @@ struct RegisteredAction
     }
 };
 
+
+
+
+
+
+
+
+
+
+
+class ActionModel {
+public:
+    std::map<std::string, std::map<std::string, std::any>> actions;
+
+    // Get the index of the action (if present)
+    std::optional<int> get_index() const {
+        for (const auto& [action_name, params] : actions) {
+            auto it = params.find("index");
+            if (it != params.end() && it->second.type() == typeid(int)) {
+                return std::any_cast<int>(it->second);
+            }
+        }
+        return std::nullopt;
+    }
+
+    // Set the index of the first action
+    void set_index(int index) {
+        if (actions.empty()) return;
+
+        auto it = actions.begin(); // First action
+        auto& params = it->second;
+        params["index"] = index;
+    }
+
+    // Debug: print the current index (if any)
+    void print_index() const {
+        auto index = get_index();
+        if (index) {
+            std::cout << "Index = " << *index << std::endl;
+        } else {
+            std::cout << "Index not set." << std::endl;
+        }
+    }
+};
+
+
+
+
+
 // ActionRegistry definition
 class ActionRegistry
 {
