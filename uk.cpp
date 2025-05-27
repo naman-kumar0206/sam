@@ -183,22 +183,68 @@ public:
 // Example usage
 int main()
 {
+    std::cout << "=== Testing ActionRegistry and RegisteredAction ===" << std::endl;
+
+    // Create an ActionRegistry
     ActionRegistry registry;
 
-    RegisteredAction example_action;
-    example_action.name = "click_element";
-    example_action.description = "Click on a web element";
-    example_action.param_model.properties = {{"selector", "string"}, {"index", "int"}};
-    example_action.domains = std::vector<std::string>{"*.example.com"};
-    example_action.page_filter = [](const Page &page)
+    // Register a sample action
+    RegisteredAction click_action;
+    click_action.name = "click_element";
+    click_action.description = "Click on a web element";
+    click_action.param_model.properties = {{"selector", "string"}, {"index", "int"}};
+    click_action.domains = std::vector<std::string>{"*.example.com"};
+
+    // Page filter: only allow pages with 'clickable' in the URL
+    click_action.page_filter = [](const Page &page)
     {
         return page.url.find("clickable") != std::string::npos;
     };
 
-    registry.actions[example_action.name] = example_action;
+    // Register the action
+    registry.actions[click_action.name] = click_action;
 
-    Page current_page("https://www.example.com/clickable");
-    std::cout << registry.get_prompt_description(current_page);
+    // Create a Page object
+    Page valid_page("https://www.example.com/clickable");
+    Page invalid_page("https://www.example.com/nonclickable");
+    Page wrong_domain("https://www.other.com/clickable");
+
+    // Test: Get prompt description for valid page
+    std::cout << "\n[Valid Page] Prompt Description:\n";
+    std::cout << registry.get_prompt_description(valid_page) << std::endl;
+
+    // Test: Invalid due to page content
+    std::cout << "[Invalid Page (no 'clickable')] Prompt Description:\n";
+    std::cout << registry.get_prompt_description(invalid_page) << std::endl;
+
+    // Test: Invalid due to domain mismatch
+    std::cout << "[Invalid Page (wrong domain)] Prompt Description:\n";
+    std::cout << registry.get_prompt_description(wrong_domain) << std::endl;
+
+    // Test: Global prompt with no page context (should skip due to domain/page_filter)
+    std::cout << "[No Page Provided] Prompt Description:\n";
+    std::cout << registry.get_prompt_description() << std::endl;
+
+    std::cout << "\n=== Testing ActionModel Index Management ===" << std::endl;
+
+    ActionModel model;
+    // Simulate adding one action with params
+    model.actions["click_element"] = {{"selector", std::string("button.submit")}, {"index", 2}};
+
+    // Print initial index
+    model.print_index(); // Should print: Index = 2
+
+    // Set a new index
+    model.set_index(5);
+    model.print_index(); // Should print: Index = 5
+
+    // Set and get index when no actions exist
+    ActionModel empty_model;
+    empty_model.print_index(); // Should print: Index not set.
+    empty_model.set_index(10); // Should have no effect
+    empty_model.print_index(); // Still: Index not set.
+
+    std::cout << "\n=== All Tests Completed Successfully ===" << std::endl;
 
     return 0;
 }
