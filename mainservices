@@ -1,0 +1,744 @@
+#include <future>
+#include <memory>
+#include <string>
+#include <vector>
+#include <functional>
+#include <thread>
+#include <chrono>
+#include <stdexcept>
+#include <iostream>
+#include <sstream>
+#include <map>
+#include <any>
+
+// Forward declarations for blackbox classes
+class BaseChatModel;
+class PromptTemplate;
+class ElementHandle;
+class Page;
+class BaseModel;
+class ActionModel;
+class ActionResult;
+class BrowserContext;
+class Registry;
+class ClickElementAction;
+class CloseTabAction;
+class DoneAction;
+class DragDropAction;
+class GoToUrlAction;
+class InputTextAction;
+class NoParamsAction;
+class OpenTabAction;
+class Position;
+class ScrollAction;
+class SearchGoogleAction;
+class SendKeysAction;
+class SwitchTabAction;
+
+// Logger class (simplified)
+class Logger {
+public:
+    void info(const std::string& msg) {
+        std::cout << "[INFO] " << msg << std::endl;
+    }
+    
+    void debug(const std::string& msg) {
+        std::cout << "[DEBUG] " << msg << std::endl;
+    }
+    
+    void warning(const std::string& msg) {
+        std::cout << "[WARNING] " << msg << std::endl;
+    }
+};
+
+static Logger logger;
+
+// Generic Controller class
+template<typename Context>
+class Controller {
+private:
+    std::unique_ptr<Registry<Context>> registry;
+    
+public:
+    Controller(const std::vector<std::string>& exclude_actions = {}, 
+               std::shared_ptr<BaseModel> output_model = nullptr) {
+        registry = std::make_unique<Registry<Context>>(exclude_actions);
+        
+        // Register all default browser actions
+        if (output_model != nullptr) {
+            // Create a new model that extends the output model with success parameter
+            class ExtendedOutputModel : public BaseModel {
+            public:
+                bool success = true;
+                std::shared_ptr<BaseModel> data;
+            };
+            
+            // Register done action with ExtendedOutputModel
+            registry->action(
+                "Complete task - with return text and if the task is finished (success=True) or not yet completely finished (success=False), because last step is reached",
+                [](const ExtendedOutputModel& params) -> std::future<ActionResult> {
+                    return std::async(std::launch::async, [params]() {
+                        // Exclude success from the output JSON since it's an internal parameter
+                        std::string output_json = params.data->model_dump();
+                        
+                        // Convert enums to string (simplified)
+                        // In actual implementation, would need proper enum handling
+                        
+                        return ActionResult(true, params.success, output_json);
+                    });
+                }
+            );
+        } else {
+            // Register done action with DoneAction
+            registry->action(
+                "Complete task - with return text and if the task is finished (success=True) or not yet completely finished (success=False), because last step is reached",
+                [](const DoneAction& params) -> std::future<ActionResult> {
+                    return std::async(std::launch::async, [params]() {
+                        return ActionResult(true, params.success, params.text);
+                    });
+                }
+            );
+        }
+        
+        // Basic Navigation Actions
+        registry->action(
+            "Search the query in Google in the current tab, the query should be a search query like humans search in Google, concrete and not vague or super long. More the single most important items.",
+            [](const SearchGoogleAction& params, BrowserContext& browser) -> std::future<ActionResult> {
+                return std::async(std::launch::async, [params, &browser]() {
+                    auto page = browser.get_current_page().get();
+                    std::string url = "https://www.google.com/search?q=" + params.query + "&udm=14";
+                    page->goto(url);
+                    page->wait_for_load_state();
+                    
+                    std::string msg = "🔍  Searched for \"" + params.query + "\" in Google";
+                    logger.info(msg);
+                    return ActionResult(false, true, msg, true);
+                });
+            }
+        );
+        
+        registry->action(
+            "Navigate to URL in the current tab",
+            [](const GoToUrlAction& params, BrowserContext& browser) -> std::future<ActionResult> {
+                return std::async(std::launch::async, [params, &browser]() {
+                    auto page = browser.get_current_page().get();
+                    page->goto(params.url);
+                    page->wait_for_load_state();
+                    
+                    std::string msg = "🔗  Navigated to " + params.url;
+                    logger.info(msg);
+                    return ActionResult(false, true, msg, true);
+                });
+            }
+        );
+        
+        registry->action(
+            "Go back",
+            [](const NoParamsAction& params, BrowserContext& browser) -> std::future<ActionResult> {
+                return std::async(std::launch::async, [&browser]() {
+                    browser.go_back();
+                    std::string msg = "🔙  Navigated back";
+                    logger.info(msg);
+                    return ActionResult(false, true, msg, true);
+                });
+            }
+        );
+        
+        // Wait for x seconds
+        registry->action(
+            "Wait for x seconds default 3",
+            [](int seconds = 3) -> std::future<ActionResult> {
+                return std::async(std::launch::async, [seconds]() {
+                    std::string msg = "🕒  Waiting for " + std::to_string(seconds) + " seconds";
+                    logger.info(msg);
+                    std::this_thread::sleep_for(std::chrono::seconds(seconds));
+                    return ActionResult(false, true, msg, true);
+                });
+            }
+        );
+        
+        // Element Interaction Actions
+        registry->action(
+            "Click element by index",
+            [](const ClickElementAction& params, BrowserContext& browser) -> std::future<ActionResult> {
+                return std::async(std::launch::async, [params, &browser]() {
+                    try {
+                        auto session = browser.get_session().get();
+                        auto selector_map = browser.get_selector_map().get();
+                        
+                        if (selector_map.find(params.index) == selector_map.end()) {
+                            throw std::runtime_error("Element with index " + std::to_string(params.index) + 
+                                                   " does not exist - retry or use alternative actions");
+                        }
+                        
+                        auto element_node = browser.get_dom_element_by_index(params.index).get();
+                        int initial_pages = session->context.pages.size();
+                        
+                        // Check if element has file uploader
+                        if (browser.is_file_uploader(element_node).get()) {
+                            std::string msg = "Index " + std::to_string(params.index) + 
+                                            " - has an element which opens file upload dialog. To upload files please use a specific function to upload files";
+                            logger.info(msg);
+                            return ActionResult(false, true, msg, true);
+                        }
+                        
+                        std::string msg;
+                        auto download_path = browser._click_element_node(element_node).get();
+                        
+                        if (!download_path.empty()) {
+                            msg = "💾  Downloaded file to " + download_path;
+                        } else {
+                            std::string element_text = element_node->get_all_text_till_next_clickable_element(2);
+                            msg = "🖱️  Clicked button with index " + std::to_string(params.index) + ": " + element_text;
+                        }
+                        
+                        logger.info(msg);
+                        logger.debug("Element xpath: " + element_node->xpath);
+                        
+                        if (session->context.pages.size() > initial_pages) {
+                            std::string new_tab_msg = "New tab opened - switching to it";
+                            msg += " - " + new_tab_msg;
+                            logger.info(new_tab_msg);
+                            browser.switch_to_tab(-1);
+                        }
+                        
+                        return ActionResult(false, true, msg, true);
+                        
+                    } catch (const std::exception& e) {
+                        logger.warning("Element not clickable with index " + std::to_string(params.index) + 
+                                     " - most likely the page changed");
+                        return ActionResult(false, false, "", false, e.what());
+                    }
+                });
+            }
+        );
+        
+        // Input text action
+        registry->action(
+            "Input text into a input interactive element",
+            [](const InputTextAction& params, BrowserContext& browser, bool has_sensitive_data = false) -> std::future<ActionResult> {
+                return std::async(std::launch::async, [params, &browser, has_sensitive_data]() {
+                    try {
+                        auto selector_map = browser.get_selector_map().get();
+                        if (selector_map.find(params.index) == selector_map.end()) {
+                            throw std::runtime_error("Element index " + std::to_string(params.index) + 
+                                                   " does not exist - retry or use alternative actions");
+                        }
+                        
+                        auto element_node = browser.get_dom_element_by_index(params.index).get();
+                        browser._input_text_element_node(element_node, params.text);
+                        
+                        std::string msg;
+                        if (!has_sensitive_data) {
+                            msg = "⌨️  Input " + params.text + " into index " + std::to_string(params.index);
+                        } else {
+                            msg = "⌨️  Input sensitive data into index " + std::to_string(params.index);
+                        }
+                        
+                        logger.info(msg);
+                        logger.debug("Element xpath: " + element_node->xpath);
+                        return ActionResult(false, true, msg, true);
+                        
+                    } catch (const std::exception& e) {
+                        return ActionResult(false, false, "", false, e.what());
+                    }
+                });
+            }
+        );
+        
+        // Save PDF action
+        registry->action(
+            "Save the current page as a PDF file",
+            [](BrowserContext& browser) -> std::future<ActionResult> {
+                return std::async(std::launch::async, [&browser]() {
+                    auto page = browser.get_current_page().get();
+                    std::string url = page->url;
+                    
+                    // Remove protocol and www, replace non-alphanumeric with dashes
+                    std::string short_url = std::regex_replace(url, std::regex("^https?://(?:www\\.)?|/$"), "");
+                    std::string slug = std::regex_replace(short_url, std::regex("[^a-zA-Z0-9]+"), "-");
+                    // Remove leading/trailing dashes and convert to lowercase
+                    slug = std::regex_replace(slug, std::regex("^-+|-+$"), "");
+                    std::transform(slug.begin(), slug.end(), slug.begin(), ::tolower);
+                    std::string sanitized_filename = slug + ".pdf";
+                    
+                    page->emulate_media("screen");
+                    page->pdf(sanitized_filename, "A4", false);
+                    
+                    std::string msg = "Saving page with URL " + url + " as PDF to ./" + sanitized_filename;
+                    logger.info(msg);
+                    return ActionResult(false, true, msg, true);
+                });
+            }
+        );
+        
+        // Tab Management Actions
+        registry->action(
+            "Switch tab",
+            [](const SwitchTabAction& params, BrowserContext& browser) -> std::future<ActionResult> {
+                return std::async(std::launch::async, [params, &browser]() {
+                    browser.switch_to_tab(params.page_id);
+                    // Wait for tab to be ready and ensure references are synchronized
+                    auto page = browser.get_agent_current_page().get();
+                    page->wait_for_load_state();
+                    
+                    std::string msg = "🔄  Switched to tab " + std::to_string(params.page_id);
+                    logger.info(msg);
+                    return ActionResult(false, true, msg, true);
+                });
+            }
+        );
+        
+        registry->action(
+            "Open url in new tab",
+            [](const OpenTabAction& params, BrowserContext& browser) -> std::future<ActionResult> {
+                return std::async(std::launch::async, [params, &browser]() {
+                    browser.create_new_tab(params.url);
+                    // Ensure tab references are properly synchronized
+                    browser.get_agent_current_page(); // this has side-effects
+                    
+                    std::string msg = "🔗  Opened new tab with " + params.url;
+                    logger.info(msg);
+                    return ActionResult(false, true, msg, true);
+                });
+            }
+        );
+        
+        registry->action(
+            "Close an existing tab",
+            [](const CloseTabAction& params, BrowserContext& browser) -> std::future<ActionResult> {
+                return std::async(std::launch::async, [params, &browser]() {
+                    browser.switch_to_tab(params.page_id);
+                    auto page = browser.get_current_page().get();
+                    std::string url = page->url;
+                    page->close();
+                    
+                    std::string msg = "❌  Closed tab #" + std::to_string(params.page_id) + " with url " + url;
+                    logger.info(msg);
+                    return ActionResult(false, true, msg, true);
+                });
+            }
+        );
+        
+        // Content Actions
+        registry->action(
+            "Extract page content to retrieve specific information from the page, e.g. all company names, a specific description, all information about, links with companies in structured format or simply links",
+            [](const std::string& goal, bool should_strip_link_urls, BrowserContext& browser, BaseChatModel& page_extraction_llm) -> std::future<ActionResult> {
+                return std::async(std::launch::async, [goal, should_strip_link_urls, &browser, &page_extraction_llm]() {
+                    try {
+                        auto page = browser.get_current_page().get();
+                        
+                        std::vector<std::string> strip;
+                        if (should_strip_link_urls) {
+                            strip = {"a", "img"};
+                        }
+                        
+                        std::string content = page->markdownify_content(strip);
+                        
+                        // Manually append iframe text into the content
+                        auto frames = page->frames;
+                        for (const auto& frame : frames) {
+                            if (frame->url != page->url && !frame->url.starts_with("data:")) {
+                                content += "\n\nIFRAME " + frame->url + ":\n";
+                                content += frame->markdownify_content();
+                            }
+                        }
+                        
+                        std::string prompt = "Your task is to extract the content of the page. You will be given a page and a goal and you should extract all relevant information around this goal from the page. If the goal is vague, summarize the page. Respond in json format. Extraction goal: " + goal + ", Page: " + content;
+                        
+                        PromptTemplate template({"goal", "page"}, prompt);
+                        
+                        try {
+                            auto output = page_extraction_llm.ainvoke(template.format({{"goal", goal}, {"page", content}})).get();
+                            std::string msg = "📄  Extracted from page\n: " + output.content + "\n";
+                            logger.info(msg);
+                            return ActionResult(false, true, msg, true);
+                        } catch (const std::exception& e) {
+                            logger.debug("Error extracting content: " + std::string(e.what()));
+                            std::string msg = "📄  Extracted from page\n: " + content + "\n";
+                            logger.info(msg);
+                            return ActionResult(false, true, msg, false);
+                        }
+                        
+                    } catch (const std::exception& e) {
+                        return ActionResult(false, false, "", false, e.what());
+                    }
+                });
+            }
+        );
+        
+        // Scroll Actions
+        registry->action(
+            "Scroll down the page by pixel amount - if no amount is specified, scroll down one page",
+            [](const ScrollAction& params, BrowserContext& browser) -> std::future<ActionResult> {
+                return std::async(std::launch::async, [params, &browser]() {
+                    auto page = browser.get_current_page().get();
+                    
+                    if (params.amount.has_value()) {
+                        page->evaluate("window.scrollBy(0, " + std::to_string(params.amount.value()) + ");");
+                    } else {
+                        page->evaluate("window.scrollBy(0, window.innerHeight);");
+                    }
+                    
+                    std::string amount = params.amount.has_value() ? 
+                                       std::to_string(params.amount.value()) + " pixels" : "one page";
+                    std::string msg = "🔍  Scrolled down the page by " + amount;
+                    logger.info(msg);
+                    return ActionResult(false, true, msg, true);
+                });
+            }
+        );
+        
+        registry->action(
+            "Scroll up the page by pixel amount - if no amount is specified, scroll up one page",
+            [](const ScrollAction& params, BrowserContext& browser) -> std::future<ActionResult> {
+                return std::async(std::launch::async, [params, &browser]() {
+                    auto page = browser.get_current_page().get();
+                    
+                    if (params.amount.has_value()) {
+                        page->evaluate("window.scrollBy(0, -" + std::to_string(params.amount.value()) + ");");
+                    } else {
+                        page->evaluate("window.scrollBy(0, -window.innerHeight);");
+                    }
+                    
+                    std::string amount = params.amount.has_value() ? 
+                                       std::to_string(params.amount.value()) + " pixels" : "one page";
+                    std::string msg = "🔍  Scrolled up the page by " + amount;
+                    logger.info(msg);
+                    return ActionResult(false, true, msg, true);
+                });
+            }
+        );
+        
+        // Send keys action
+        registry->action(
+            "Send strings of special keys like Escape,Backspace, Insert, PageDown, Delete, Enter, Shortcuts such as `Control+o`, `Control+Shift+T` are supported as well. This gets used in keyboard.press.",
+            [](const SendKeysAction& params, BrowserContext& browser) -> std::future<ActionResult> {
+                return std::async(std::launch::async, [params, &browser]() {
+                    try {
+                        auto page = browser.get_current_page().get();
+                        
+                        try {
+                            page->keyboard.press(params.keys);
+                        } catch (const std::exception& e) {
+                            std::string error_str = e.what();
+                            if (error_str.find("Unknown key") != std::string::npos) {
+                                // Loop over the keys and try to send each one
+                                for (char key : params.keys) {
+                                    try {
+                                        page->keyboard.press(std::string(1, key));
+                                    } catch (const std::exception& key_e) {
+                                        logger.debug("Error sending key " + std::string(1, key) + ": " + key_e.what());
+                                        throw key_e;
+                                    }
+                                }
+                            } else {
+                                throw e;
+                            }
+                        }
+                        
+                        std::string msg = "⌨️  Sent keys: " + params.keys;
+                        logger.info(msg);
+                        return ActionResult(false, true, msg, true);
+                        
+                    } catch (const std::exception& e) {
+                        return ActionResult(false, false, "", false, e.what());
+                    }
+                });
+            }
+        );
+        
+        // Scroll to text action
+        registry->action(
+            "If you dont find something which you want to interact with, scroll to it",
+            [](const std::string& text, BrowserContext& browser) -> std::future<ActionResult> {
+                return std::async(std::launch::async, [text, &browser]() {
+                    try {
+                        auto page = browser.get_current_page().get();
+                        
+                        // Try different locator strategies
+                        std::vector<std::function<std::shared_ptr<class Locator>()>> locator_funcs = {
+                            [&]() { return page->get_by_text(text, false); },
+                            [&]() { return page->locator("text=" + text); },
+                            [&]() { return page->locator("//*[contains(text(), '" + text + "')]"); }
+                        };
+                        
+                        for (auto& locator_func : locator_funcs) {
+                            try {
+                                auto locator = locator_func();
+                                if (locator->count().get() == 0) {
+                                    continue;
+                                }
+                                
+                                auto element = locator->first().get();
+                                bool is_visible = element->is_visible().get();
+                                auto bbox = element->bounding_box().get();
+                                
+                                if (is_visible && bbox && bbox->width > 0 && bbox->height > 0) {
+                                    element->scroll_into_view_if_needed();
+                                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                                    
+                                    std::string msg = "🔍  Scrolled to text: " + text;
+                                    logger.info(msg);
+                                    return ActionResult(false, true, msg, true);
+                                }
+                                
+                            } catch (const std::exception& e) {
+                                logger.debug("Locator attempt failed: " + std::string(e.what()));
+                                continue;
+                            }
+                        }
+                        
+                        std::string msg = "Text '" + text + "' not found or not visible on page";
+                        logger.info(msg);
+                        return ActionResult(false, true, msg, true);
+                        
+                    } catch (const std::exception& e) {
+                        std::string msg = "Failed to scroll to text '" + text + "': " + e.what();
+                        logger.info(msg);
+                        return ActionResult(false, false, "", false, e.what());
+                    }
+                });
+            }
+        );
+        
+        // Dropdown actions
+        registry->action(
+            "Get all options from a native dropdown",
+            [](int index, BrowserContext& browser) -> std::future<ActionResult> {
+                return std::async(std::launch::async, [index, &browser]() {
+                    try {
+                        auto page = browser.get_current_page().get();
+                        auto selector_map = browser.get_selector_map().get();
+                        auto dom_element = selector_map[index];
+                        
+                        std::vector<std::string> all_options;
+                        int frame_index = 0;
+                        
+                        for (const auto& frame : page->frames) {
+                            try {
+                                std::string js_code = R"(
+                                    (xpath) => {
+                                        const select = document.evaluate(xpath, document, null,
+                                            XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                                        if (!select) return null;
+                                        
+                                        return {
+                                            options: Array.from(select.options).map(opt => ({
+                                                text: opt.text,
+                                                value: opt.value,
+                                                index: opt.index
+                                            })),
+                                            id: select.id,
+                                            name: select.name
+                                        };
+                                    }
+                                )";
+                                
+                                auto options = frame->evaluate(js_code, dom_element->xpath).get();
+                                
+                                if (options) {
+                                    logger.debug("Found dropdown in frame " + std::to_string(frame_index));
+                                    
+                                    // Process options (simplified)
+                                    auto options_array = options->get_options();
+                                    for (const auto& opt : options_array) {
+                                        std::string formatted_option = std::to_string(opt.index) + ": text=" + opt.text;
+                                        all_options.push_back(formatted_option);
+                                    }
+                                }
+                                
+                            } catch (const std::exception& frame_e) {
+                                logger.debug("Frame " + std::to_string(frame_index) + " evaluation failed: " + frame_e.what());
+                            }
+                            
+                            frame_index++;
+                        }
+                        
+                        if (!all_options.empty()) {
+                            std::string msg;
+                            for (const auto& option : all_options) {
+                                msg += option + "\n";
+                            }
+                            msg += "Use the exact text string in select_dropdown_option";
+                            logger.info(msg);
+                            return ActionResult(false, true, msg, true);
+                        } else {
+                            std::string msg = "No options found in any frame for dropdown";
+                            logger.info(msg);
+                            return ActionResult(false, true, msg, true);
+                        }
+                        
+                    } catch (const std::exception& e) {
+                        std::string msg = "Error getting options: " + std::string(e.what());
+                        logger.info(msg);
+                        return ActionResult(false, true, msg, true);
+                    }
+                });
+            }
+        );
+        
+        registry->action(
+            "Select dropdown option for interactive element index by the text of the option you want to select",
+            [](int index, const std::string& text, BrowserContext& browser) -> std::future<ActionResult> {
+                return std::async(std::launch::async, [index, text, &browser]() {
+                    try {
+                        auto page = browser.get_current_page().get();
+                        auto selector_map = browser.get_selector_map().get();
+                        auto dom_element = selector_map[index];
+                        
+                        // Validate that we're working with a select element
+                        if (dom_element->tag_name != "select") {
+                            std::string msg = "Cannot select option: Element with index " + std::to_string(index) + 
+                                            " is a " + dom_element->tag_name + ", not a select";
+                            return ActionResult(false, true, msg, true);
+                        }
+                        
+                        logger.debug("Attempting to select '" + text + "' using xpath: " + dom_element->xpath);
+                        
+                        std::string xpath = "//" + dom_element->xpath;
+                        
+                        int frame_index = 0;
+                        for (const auto& frame : page->frames) {
+                            try {
+                                logger.debug("Trying frame " + std::to_string(frame_index) + " URL: " + frame->url);
+                                
+                                // Find dropdown in this frame
+                                std::string find_dropdown_js = R"(
+                                    (xpath) => {
+                                        try {
+                                            const select = document.evaluate(xpath, document, null,
+                                                XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                                            if (!select) return null;
+                                            if (select.tagName.toLowerCase() !== 'select') {
+                                                return {
+                                                    error: `Found element but it's a ${select.tagName}, not a SELECT`,
+                                                    found: false
+                                                };
+                                            }
+                                            return {
+                                                id: select.id,
+                                                name: select.name,
+                                                found: true,
+                                                tagName: select.tagName,
+                                                optionCount: select.options.length,
+                                                currentValue: select.value
+                                            };
+                                        } catch (e) {
+                                            return {error: e.toString(), found: false};
+                                        }
+                                    }
+                                )";
+                                
+                                auto dropdown_info = frame->evaluate(find_dropdown_js, dom_element->xpath).get();
+                                
+                                if (dropdown_info && dropdown_info->found) {
+                                    logger.debug("Found dropdown in frame " + std::to_string(frame_index));
+                                    
+                                    auto locator = frame->locator("//" + dom_element->xpath).nth(0);
+                                    auto selected_values = locator->select_option_by_label(text, 1000).get();
+                                    
+                                    std::string msg = "selected option " + text + " with value " + selected_values[0];
+                                    logger.info(msg + " in frame " + std::to_string(frame_index));
+                                    
+                                    return ActionResult(false, true, msg, true);
+                                }
+                                
+                            } catch (const std::exception& frame_e) {
+                                logger.debug("Frame " + std::to_string(frame_index) + " attempt failed: " + frame_e.what());
+                            }
+                            
+                            frame_index++;
+                        }
+                        
+                        std::string msg = "Could not select option '" + text + "' in any frame";
+                        logger.info(msg);
+                        return ActionResult(false, true, msg, true);
+                        
+                    } catch (const std::exception& e) {
+                        std::string msg = "Selection failed: " + std::string(e.what());
+                        return ActionResult(false, false, "", false, e.what());
+                    }
+                });
+            }
+        );
+        
+        // Drag and drop action
+        registry->action(
+            "Drag and drop elements or between coordinates on the page - useful for canvas drawing, sortable lists, sliders, file uploads, and UI rearrangement",
+            [](const DragDropAction& params, BrowserContext& browser) -> std::future<ActionResult> {
+                return std::async(std::launch::async, [params, &browser]() {
+                    try {
+                        auto page = browser.get_current_page().get();
+                        
+                        int source_x = 0, source_y = 0, target_x = 0, target_y = 0;
+                        int steps = std::max(1, params.steps.value_or(10));
+                        int delay_ms = std::max(0, params.delay_ms.value_or(5));
+                        
+                        // Case 1: Element selectors provided
+                        if (!params.element_source.empty() && !params.element_target.empty()) {
+                            logger.debug("Using element-based approach with selectors");
+                            
+                            auto source_element = page->locator(params.element_source).first().element_handle().get();
+                            auto target_element = page->locator(params.element_target).first().element_handle().get();
+                            
+                            if (!source_element || !target_element) {
+                                std::string error_msg = "Failed to find " + 
+                                    std::string(!source_element ? "source" : "target") + " element";
+                                return ActionResult(false, false, "", false, error_msg);
+                            }
+                            
+                            // Get coordinates from elements
+                            if (params.element_source_offset.has_value()) {
+                                source_x = params.element_source_offset->x;
+                                source_y = params.element_source_offset->y;
+                            } else {
+                                auto source_box = source_element->bounding_box().get();
+                                source_x = static_cast<int>(source_box->x + source_box->width / 2);
+                                source_y = static_cast<int>(source_box->y + source_box->height / 2);
+                            }
+                            
+                            if (params.element_target_offset.has_value()) {
+                                target_x = params.element_target_offset->x;
+                                target_y = params.element_target_offset->y;
+                            } else {
+                                auto target_box = target_element->bounding_box().get();
+                                target_x = static_cast<int>(target_box->x + target_box->width / 2);
+                                target_y = static_cast<int>(target_box->y + target_box->height / 2);
+                            }
+                        }
+                        // Case 2: Coordinates provided directly
+                        else if (params.coord_source_x.has_value() && params.coord_source_y.has_value() &&
+                                params.coord_target_x.has_value() && params.coord_target_y.has_value()) {
+                            logger.debug("Using coordinate-based approach");
+                            source_x = params.coord_source_x.value();
+                            source_y = params.coord_source_y.value();
+                            target_x = params.coord_target_x.value();
+                            target_y = params.coord_target_y.value();
+                        } else {
+                            std::string error_msg = "Must provide either source/target selectors or source/target coordinates";
+                            return ActionResult(false, false, "", false, error_msg);
+                        }
+                        
+                        // Execute drag operation
+                        try {
+                            page->mouse.move(source_x, source_y);
+                            logger.debug("Moved to source position (" + std::to_string(source_x) + ", " + std::to_string(source_y) + ")");
+                            
+                            page->mouse.down();
+                            
+                            // Move to target position with intermediate steps
+                            for (int i = 1; i <= steps; i++) {
+                                double ratio = static_cast<double>(i) / steps;
+                                int intermediate_x = static_cast<int>(source_x + (target_x - source_x) * ratio);
+                                int intermediate_y = static_cast<int>(source_y + (target_y - source_y) * ratio);
+                                
+                                page->mouse.move(intermediate_x, intermediate_y);
+                                
+                                if (delay_ms > 0) {
+                                    std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+                                }
+                            }
+                            
+                            page->mouse.move(target_x, target_y);
+                            page->mouse.move(target_x, target_y); // Move again to ensure drag
