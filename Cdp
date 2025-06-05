@@ -1,0 +1,117 @@
+// File: cdp_dom_fetch.cpp
+
+#include <libwebsockets.h>
+#include <nlohmann/json.hpp>
+#include <iostream>
+#include <string>
+#include <vector>
+#include <cstring>
+
+using json = nlohmann::json;
+
+static int callback_cdp(struct lws *wsi, enum lws_callback_reasons reason,
+                        void *user, void *in, size_t len) {
+    switch (reason) {
+        case LWS_CALLBACK_CLIENT_ESTABLISHED:
+            lwsl_user("Connected to CDP\n");
+            lws_callback_on_writable(wsi);
+            break;
+
+        case LWS_CALLBACK_CLIENT_WRITEABLE: {
+            std::string msg = R"({
+                "id": 1,
+                "method": "DOM.getDocument",
+                "params": { "depth": 1, "pierce": true }
+            })";
+
+            std::vector<unsigned char> buf(LWS_PRE + msg.size());
+            std::memcpy(buf.data() + LWS_PRE, msg.c_str(), msg.size());
+
+            lws_write(wsi, buf.data() + LWS_PRE, msg.size(), LWS_WRITE_TEXT);
+            break;
+        }
+
+        case LWS_CALLBACK_CLIENT_RECEIVE: {
+            std::string data((const char*)in, len);
+            std::cout << "Received: " << data << std::endl;
+
+            try {
+                json response = json::parse(data);
+                if (response.contains("result") && response["id"] == 1) {
+                    auto root = response["result"]["root"];
+                    int nodeId = root["nodeId"];
+                    std::cout << "Root node ID: " << nodeId << std::endl;
+
+                    // Prepare getOuterHTML message
+                    json msg2 = {
+                        {"id", 2},
+                        {"method", "DOM.getOuterHTML"},
+                        {"params", {{"nodeId", nodeId}}}
+                    };
+
+                    std::string payload = msg2.dump();
+                    std::vector<unsigned char> buf(LWS_PRE + payload.size());
+                    std::memcpy(buf.data() + LWS_PRE, payload.c_str(), payload.size());
+                    lws_write(wsi, buf.data() + LWS_PRE, payload.size(), LWS_WRITE_TEXT);
+
+                } else if (response["id"] == 2 && response.contains("result")) {
+                    std::cout << "DOM HTML:\n" << response["result"]["outerHTML"] << std::endl;
+                }
+            } catch (const std::exception &e) {
+                std::cerr << "JSON parse error: " << e.what() << std::endl;
+            }
+
+            break;
+        }
+
+        case LWS_CALLBACK_CLOSED:
+            lwsl_user("Connection closed\n");
+            break;
+
+        default:
+            break;
+    }
+    return 0;
+}
+
+static struct lws_protocols protocols[] = {
+    {"cdp-protocol", callback_cdp, 0, 4096},
+    {nullptr, nullptr, 0, 0}
+};
+
+int main() {
+    struct lws_context_creation_info info;
+    memset(&info, 0, sizeof(info));
+    info.port = CONTEXT_PORT_NO_LISTEN;
+    info.protocols = protocols;
+    info.gid = -1;
+    info.uid = -1;
+
+    struct lws_context *context = lws_create_context(&info);
+    if (!context) {
+        std::cerr << "Failed to create lws context\n";
+        return 1;
+    }
+
+    struct lws_client_connect_info ccinfo = {};
+    ccinfo.context = context;
+    ccinfo.address = "localhost";
+    ccinfo.port = 9222;
+    ccinfo.path = "/devtools/page/<your-tab-id>";  // Replace with actual tab ID
+    ccinfo.host = ccinfo.address;
+    ccinfo.origin = ccinfo.address;
+    ccinfo.protocol = "cdp-protocol";
+    ccinfo.ssl_connection = 0;
+
+    if (!lws_client_connect_via_info(&ccinfo)) {
+        std::cerr << "WebSocket connection failed\n";
+        return 1;
+    }
+
+    while (lws_service(context, 1000) >= 0) {
+        // event loop
+    }
+
+    lws_context_destroy(context);
+    return 0;
+}
