@@ -1,66 +1,51 @@
 #include <libwebsockets.h>
-#include <rapidjson/document.h>
-#include <rapidjson/writer.h>
-#include <rapidjson/stringbuffer.h>
-#include <iostream>
 #include <string>
+#include <iostream>
 #include <cstring>
 
-static int callback_cdp(struct lws *wsi,
-                        enum lws_callback_reasons reason,
-                        void *user,
-                        void *in,
-                        size_t len)
+static int callback_cdp(struct lws* wsi, enum lws_callback_reasons reason,
+                        void* user, void* in, size_t len)
 {
     switch (reason) {
-        case LWS_CALLBACK_CLIENT_ESTABLISHED:
-            std::cout << "✅ Connected to CDP\n";
+    case LWS_CALLBACK_CLIENT_ESTABLISHED:
+        std::cout << "Connected to CDP server\n";
+        break;
 
-            // Send CDP command to get DOM
-            {
-                rapidjson::Document doc;
-                doc.SetObject();
-                auto& alloc = doc.GetAllocator();
+    case LWS_CALLBACK_CLIENT_RECEIVE:
+        std::cout << "Received data:\n" << std::string((char*)in, len) << std::endl;
+        break;
 
-                doc.AddMember("id", 1, alloc);
-                doc.AddMember("method", "DOM.getDocument", alloc);
-                doc.AddMember("params", rapidjson::Value(rapidjson::kObjectType), alloc);
-
-                rapidjson::StringBuffer buffer;
-                rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
-                doc.Accept(writer);
-
-                std::string message = buffer.GetString();
-                lws_write(wsi, (unsigned char*)message.c_str(), message.length(), LWS_WRITE_TEXT);
-            }
-            break;
-
-        case LWS_CALLBACK_CLIENT_RECEIVE:
-            std::cout << "📥 Received: " << std::string((const char *)in, len) << std::endl;
-            break;
-
-        case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
-            std::cerr << "❌ Connection error\n";
-            break;
-
-        case LWS_CALLBACK_CLIENT_CLOSED:
-            std::cout << "🔌 Connection closed\n";
-            break;
-
-        default:
-            break;
+    case LWS_CALLBACK_CLIENT_WRITEABLE: {
+        // Send a simple CDP message requesting the DOM
+        std::string msg = R"({"id":1,"method":"DOM.getDocument"})";
+        unsigned char buf[LWS_PRE + 512];
+        std::memcpy(&buf[LWS_PRE], msg.c_str(), msg.length());
+        lws_write(wsi, &buf[LWS_PRE], msg.length(), LWS_WRITE_TEXT);
+        break;
     }
+
+    case LWS_CALLBACK_CLOSED:
+        std::cout << "Disconnected\n";
+        break;
+
+    default:
+        break;
+    }
+
     return 0;
 }
 
 static struct lws_protocols protocols[] = {
     {
-        "cdp-protocol",   // Protocol name (can be anything)
-        callback_cdp,     // WebSocket callback handler
-        0,                // Per-session data size (none for now)
-        65536             // Receive buffer size
+        "cdp-protocol",    // protocol name
+        callback_cdp,      // callback
+        0,                 // per-session data size
+        65536,             // max frame size
+        0,                 // id (FIXED for v4.3.2+)
+        nullptr,           // user (no user data)
+        0                  // tx packet size
     },
-    { nullptr, nullptr, 0, 0 } // terminator
+    { nullptr, nullptr, 0, 0, 0, nullptr, 0 } // terminator
 };
 
 
@@ -86,47 +71,53 @@ static struct lws_protocols protocols[] = {
 
 
 
-void Mainview::Onservice()
-{
-    struct lws_context_creation_info info;
-    memset(&info, 0, sizeof(info));
-    info.port = CONTEXT_PORT_NO_LISTEN;  // We don't need a listening server
-    info.protocols = protocols;
-    info.gid = -1;
-    info.uid = -1;
 
-    struct lws_context* context = lws_create_context(&info);
-    if (!context) {
-        std::cerr << "❌ Failed to create LWS context\n";
-        return;
-    }
 
-    struct lws_client_connect_info i;
-    memset(&i, 0, sizeof(i));
 
-    i.context = context;
-    i.address = "localhost";       // Change if browser is remote
-    i.port = 9222;                 // CDP remote-debugging port
-    i.path = "/devtools/page/1";  // Get valid page WebSocket endpoint from /json
-    i.host = i.address;
-    i.origin = i.address;
-    i.protocol = protocols[0].name;
-    i.ssl_connection = 0;          // No TLS
-    i.pwsi = nullptr;
 
-    struct lws* wsi = lws_client_connect_via_info(&i);
-    if (!wsi) {
-        std::cerr << "❌ Failed to connect to CDP WebSocket\n";
-        lws_context_destroy(context);
-        return;
-    }
 
-    std::cout << "🚀 Connecting to CDP...\n";
 
-    // Run event loop
-    while (lws_service(context, 1000) >= 0) {
-        // Loop until user stops or WebSocket closes
-    }
 
-    lws_context_destroy(context);
+
+
+
+struct lws_context_creation_info info;
+std::memset(&info, 0, sizeof(info));
+info.port = CONTEXT_PORT_NO_LISTEN;
+info.protocols = protocols;
+info.gid = -1;
+info.uid = -1;
+
+lws_context* context = lws_create_context(&info);
+if (!context) {
+    std::cerr << "Failed to create LWS context\n";
+    return;
 }
+
+struct lws_client_connect_info i;
+std::memset(&i, 0, sizeof(i));
+i.context = context;
+i.address = "localhost";     // CDP host
+i.port = 9222;               // CDP port
+i.path = "/devtools/browser/<REPLACE-WITH-TARGET-ID>"; // Replace with your browser target path
+i.host = i.address;
+i.origin = i.address;
+i.protocol = protocols[0].name;
+i.ssl_connection = 0;
+
+if (!lws_client_connect_via_info(&i)) {
+    std::cerr << "WebSocket connection failed\n";
+    lws_context_destroy(context);
+    return;
+}
+
+std::cout << "CDP WebSocket client started...\n";
+
+while (lws_service(context, 1000) >= 0) {
+    // Run event loop
+}
+
+lws_context_destroy(context);
+
+
+
