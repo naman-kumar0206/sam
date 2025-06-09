@@ -1,0 +1,138 @@
+#include <iostream>
+#include <map>
+#include <string>
+#include <sstream>
+#include <rapidjson/document.h>
+#include <rapidjson/error/en.h>
+#include <libwebsockets.h>
+
+// Structure to hold extracted DOM element
+struct DomElement {
+    std::string tag;
+    std::string xpath;
+    std::string text;
+    bool clickable;
+};
+
+// Function to parse DOM JSON using RapidJSON
+std::map<int, DomElement> parseDomJson(const std::string& jsonString) {
+    using namespace rapidjson;
+    std::map<int, DomElement> domMap;
+
+    Document d;
+    if (d.Parse(jsonString.c_str()).HasParseError()) {
+        std::cerr << "JSON parse error: "
+                  << GetParseError_En(d.GetParseError()) << "\n";
+        return domMap;
+    }
+
+    if (!d.IsObject() || !d.HasMember("result") || !d["result"].HasMember("result"))
+        return domMap;
+
+    const Value& elements = d["result"]["result"]["value"];
+    for (auto it = elements.MemberBegin(); it != elements.MemberEnd(); ++it) {
+        int index = std::stoi(it->name.GetString());
+        const Value& val = it->value;
+
+        DomElement el;
+        el.tag = val["tag"].GetString();
+        el.xpath = val["xpath"].GetString();
+        el.text = val["text"].GetString();
+        el.clickable = val["clickable"].GetBool();
+
+        domMap[index] = el;
+    }
+
+    return domMap;
+}
+
+// JavaScript snippet to extract clickable DOM elements
+std::string getJavascriptCode() {
+    std::string js_code = R"((() => {
+      function getXPath(el) {
+        if (el.id) return `//*[@id="${el.id}"]`;
+        const parts = [];
+        while (el && el.nodeType === 1) {
+          let i = 1, sib = el.previousElementSibling;
+          while (sib) {
+            if (sib.tagName === el.tagName) i++;
+            sib = sib.previousElementSibling;
+          }
+          parts.unshift(el.tagName + '[' + i + ']');
+          el = el.parentElement;
+        }
+        return '/' + parts.join('/');
+      }
+      const elements = document.querySelectorAll('*');
+      const result = {};
+      let index = 0;
+      for (const el of elements) {
+        const r = el.getBoundingClientRect();
+        const isVisible = r.width > 0 && r.height > 0;
+        const isClickable = ['A', 'BUTTON', 'INPUT'].includes(el.tagName) || el.onclick;
+        if (isVisible && isClickable) {
+          result[index++] = {
+            tag: el.tagName,
+            xpath: getXPath(el),
+            text: el.innerText,
+            clickable: true
+          };
+        }
+      }
+      return result;
+    })())";
+    return js_code;
+}
+
+// Compose Chrome DevTools Protocol (CDP) message
+std::string createCDPMessage(const std::string& js_code) {
+    std::ostringstream oss;
+    oss << R"({"id":1,"method":"Runtime.evaluate","params":{"expression":"""")
+        << js_code << R"(""","returnByValue":true}})";
+    return oss.str();
+}
+
+// Mock main logic (you would replace this with your libwebsockets setup)
+int main() {
+    // Get the JavaScript to send
+    std::string js_code = getJavascriptCode();
+    std::string cdp_message = createCDPMessage(js_code);
+
+    std::cout << "Send this message over WebSocket:\n" << cdp_message << "\n\n";
+
+    // Simulate receiving a JSON response from the browser
+    std::string json_response = R"({
+      "id": 1,
+      "result": {
+        "result": {
+          "type": "object",
+          "value": {
+            "0": {
+              "tag": "BUTTON",
+              "xpath": "/HTML[1]/BODY[1]/BUTTON[1]",
+              "text": "Click Me",
+              "clickable": true
+            },
+            "1": {
+              "tag": "A",
+              "xpath": "/HTML[1]/BODY[1]/A[1]",
+              "text": "Home",
+              "clickable": true
+            }
+          }
+        }
+      }
+    })";
+
+    // Parse response
+    std::map<int, DomElement> dom = parseDomJson(json_response);
+
+    // Print DOM Elements
+    for (const auto& [idx, el] : dom) {
+        std::cout << "[" << idx << "] Tag: " << el.tag
+                  << ", Text: " << el.text
+                  << ", XPath: " << el.xpath << "\n";
+    }
+
+    return 0;
+}
