@@ -3,136 +3,131 @@
 #include <string>
 #include <sstream>
 #include <rapidjson/document.h>
-#include <rapidjson/error/en.h>
+#include <rapidjson/stringbuffer.h>
+#include <rapidjson/writer.h>
 #include <libwebsockets.h>
 
-// Structure to hold extracted DOM element
-struct DomElement {
+// Element structure
+struct ClickableElement {
     std::string tag;
-    std::string xpath;
-    std::string text;
-    bool clickable;
+    std::string nodeId;
+    std::string outerHTML;
+    int index;
 };
 
-// Function to parse DOM JSON using RapidJSON
-std::map<int, DomElement> parseDomJson(const std::string& jsonString) {
-    using namespace rapidjson;
-    std::map<int, DomElement> domMap;
+// Placeholder: store elements indexed by ID
+std::map<int, ClickableElement> clickableElements;
 
-    Document d;
-    if (d.Parse(jsonString.c_str()).HasParseError()) {
-        std::cerr << "JSON parse error: "
-                  << GetParseError_En(d.GetParseError()) << "\n";
-        return domMap;
-    }
+// === WebSocket Callbacks ===
+static int callback_ws(struct lws* wsi, enum lws_callback_reasons reason,
+                       void* user, void* in, size_t len) {
+    switch (reason) {
+        case LWS_CALLBACK_CLIENT_RECEIVE: {
+            std::string json_msg((const char*)in, len);
+            rapidjson::Document doc;
+            doc.Parse(json_msg.c_str());
 
-    if (!d.IsObject() || !d.HasMember("result") || !d["result"].HasMember("result"))
-        return domMap;
-
-    const Value& elements = d["result"]["result"]["value"];
-    for (auto it = elements.MemberBegin(); it != elements.MemberEnd(); ++it) {
-        int index = std::stoi(it->name.GetString());
-        const Value& val = it->value;
-
-        DomElement el;
-        el.tag = val["tag"].GetString();
-        el.xpath = val["xpath"].GetString();
-        el.text = val["text"].GetString();
-        el.clickable = val["clickable"].GetBool();
-
-        domMap[index] = el;
-    }
-
-    return domMap;
-}
-
-// JavaScript snippet to extract clickable DOM elements
-std::string getJavascriptCode() {
-    std::string js_code = R"((() => {
-      function getXPath(el) {
-        if (el.id) return `//*[@id="${el.id}"]`;
-        const parts = [];
-        while (el && el.nodeType === 1) {
-          let i = 1, sib = el.previousElementSibling;
-          while (sib) {
-            if (sib.tagName === el.tagName) i++;
-            sib = sib.previousElementSibling;
-          }
-          parts.unshift(el.tagName + '[' + i + ']');
-          el = el.parentElement;
-        }
-        return '/' + parts.join('/');
-      }
-      const elements = document.querySelectorAll('*');
-      const result = {};
-      let index = 0;
-      for (const el of elements) {
-        const r = el.getBoundingClientRect();
-        const isVisible = r.width > 0 && r.height > 0;
-        const isClickable = ['A', 'BUTTON', 'INPUT'].includes(el.tagName) || el.onclick;
-        if (isVisible && isClickable) {
-          result[index++] = {
-            tag: el.tagName,
-            xpath: getXPath(el),
-            text: el.innerText,
-            clickable: true
-          };
-        }
-      }
-      return result;
-    })())";
-    return js_code;
-}
-
-// Compose Chrome DevTools Protocol (CDP) message
-std::string createCDPMessage(const std::string& js_code) {
-    std::ostringstream oss;
-    oss << R"({"id":1,"method":"Runtime.evaluate","params":{"expression":"""")
-        << js_code << R"(""","returnByValue":true}})";
-    return oss.str();
-}
-
-// Mock main logic (you would replace this with your libwebsockets setup)
-int main() {
-    // Get the JavaScript to send
-    std::string js_code = getJavascriptCode();
-    std::string cdp_message = createCDPMessage(js_code);
-
-    std::cout << "Send this message over WebSocket:\n" << cdp_message << "\n\n";
-
-    // Simulate receiving a JSON response from the browser
-    std::string json_response = R"({
-      "id": 1,
-      "result": {
-        "result": {
-          "type": "object",
-          "value": {
-            "0": {
-              "tag": "BUTTON",
-              "xpath": "/HTML[1]/BODY[1]/BUTTON[1]",
-              "text": "Click Me",
-              "clickable": true
-            },
-            "1": {
-              "tag": "A",
-              "xpath": "/HTML[1]/BODY[1]/A[1]",
-              "text": "Home",
-              "clickable": true
+            if (doc.HasParseError()) {
+                std::cerr << "JSON parse error\n";
+                return -1;
             }
-          }
+
+            // Handle result from querySelectorAll
+            if (doc.HasMember("result")) {
+                const auto& result = doc["result"];
+                if (result.HasMember("result")) {
+                    const auto& list = result["result"]["value"];
+                    int idx = 0;
+                    for (auto it = list.MemberBegin(); it != list.MemberEnd(); ++it) {
+                        const auto& val = it->value;
+                        if (val.HasMember("description")) {
+                            std::string desc = val["description"].GetString();
+                            if (desc.find("<button") != std::string::npos || desc.find("<a") != std::string::npos) {
+                                ClickableElement elem;
+                                elem.tag = (desc.find("<a") != std::string::npos) ? "A" : "BUTTON";
+                                elem.index = idx++;
+                                elem.outerHTML = desc;
+                                clickableElements[elem.index] = elem;
+                            }
+                        }
+                    }
+                    std::cout << "✅ Found " << clickableElements.size() << " clickable elements.\n";
+                }
+            }
+
+            break;
         }
-      }
-    })";
 
-    // Parse response
-    std::map<int, DomElement> dom = parseDomJson(json_response);
+        case LWS_CALLBACK_CLIENT_ESTABLISHED: {
+            std::cout << "🔗 Connected to browser WebSocket\n";
 
-    // Print DOM Elements
-    for (const auto& [idx, el] : dom) {
-        std::cout << "[" << idx << "] Tag: " << el.tag
-                  << ", Text: " << el.text
-                  << ", XPath: " << el.xpath << "\n";
+            // Send Runtime.globalLexicalScopeNames just to check connection
+            std::string message = R"({
+                "id": 1,
+                "method": "Runtime.evaluate",
+                "params": {
+                    "expression": "document.querySelectorAll('a,button')",
+                    "returnByValue": true
+                }
+            })";
+
+            lws_write(wsi, (unsigned char*)message.c_str(), message.length(), LWS_WRITE_TEXT);
+            break;
+        }
+
+        default:
+            break;
+    }
+    return 0;
+}
+
+// === Protocols ===
+static struct lws_protocols protocols[] = {
+    {
+        "cdp-protocol",
+        callback_ws,
+        0,
+        4096,
+    },
+    {NULL, NULL, 0, 0}  // terminator
+};
+
+// === Entry Point ===
+int main() {
+    struct lws_context_creation_info info;
+    struct lws_client_connect_info conn_info;
+
+    memset(&info, 0, sizeof(info));
+    info.port = CONTEXT_PORT_NO_LISTEN;
+    info.protocols = protocols;
+
+    struct lws_context* context = lws_create_context(&info);
+    if (!context) {
+        std::cerr << "❌ Failed to create lws context\n";
+        return 1;
     }
 
+    memset(&conn_info, 0, sizeof(conn_info));
+    conn_info.context = context;
+    conn_info.address = "127.0.0.1";
+    conn_info.port = 9222;
+    conn_info.path = "/devtools/page/XXXXXXXX"; // Replace with actual target
+    conn_info.host = conn_info.address;
+    conn_info.origin = conn_info.address;
+    conn_info.protocol = protocols[0].name;
+    conn_info.ssl_connection = 0;
+
+    struct lws* wsi = lws_client_connect_via_info(&conn_info);
+    if (!wsi) {
+        std::cerr << "❌ Failed to connect to WebSocket\n";
+        return 1;
+    }
+
+    // Event loop
+    while (true) {
+        lws_service(context, 100);
+    }
+
+    lws_context_destroy(context);
     return 0;
 }
