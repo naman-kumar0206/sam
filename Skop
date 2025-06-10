@@ -1,23 +1,53 @@
-#include <libwebsockets.h>
-#include <nlohmann/json.hpp>
 #include <iostream>
-#include <map>
 #include <string>
-#include <sstream>
 #include <vector>
+#include <map>
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
+#include <boost/asio/connect.hpp>
+#include <boost/asio/ip/tcp.hpp>
+#include <nlohmann/json.hpp>
+#include <libwebsockets.h>
 #include <cstring>
 
-extern std::string WS_URL_PATH;  // From your main file
-
 using json = nlohmann::json;
+using tcp = boost::asio::ip::tcp;
+namespace http = boost::beast::http;
 
+// Global variable for WebSocket path
+std::string WS_URL_PATH = "";
+
+// Function to fetch WebSocket URL from Chrome
+std::string get_websocket_url_from_chrome() {
+    boost::asio::io_context ioc;
+    tcp::resolver resolver(ioc);
+    boost::beast::tcp_stream stream(ioc);
+
+    auto const results = resolver.resolve("localhost", "9222");
+    stream.connect(results);
+
+    http::request<http::string_body> req{http::verb::get, "/json", 11};
+    req.set(http::field::host, "localhost");
+    req.set(http::field::user_agent, BOOST_BEAST_VERSION_STRING);
+    http::write(stream, req);
+
+    boost::beast::flat_buffer buffer;
+    http::response<http::string_body> res;
+    http::read(stream, buffer, res);
+    stream.socket().shutdown(tcp::socket::shutdown_both);
+
+    json j = json::parse(res.body());
+    std::string ws_url = j[0]["webSocketDebuggerUrl"];
+    return ws_url;
+}
+
+// WebSocket client logic
 static struct lws_context *context;
 static struct lws *wsi_client = nullptr;
 static std::string received_payload;
 static int send_counter = 1;
 static bool dom_received = false;
 
-// Utility: Build JSON message
 std::string build_command(int id, const std::string &method, const json &params = {}) {
     json j;
     j["id"] = id;
@@ -28,7 +58,6 @@ std::string build_command(int id, const std::string &method, const json &params 
     return j.dump();
 }
 
-// Recursive DOM traversal to index clickable elements
 void traverse_dom(const json &node, int &index) {
     if (!node.contains("nodeName")) return;
 
@@ -57,14 +86,12 @@ void traverse_dom(const json &node, int &index) {
     }
 }
 
-// WebSocket callback
+// Callback handler
 static int callback_cdp(struct lws *wsi, enum lws_callback_reasons reason,
                         void *user, void *in, size_t len) {
     switch (reason) {
         case LWS_CALLBACK_CLIENT_ESTABLISHED:
             std::cout << "✅ WebSocket connection established.\n";
-
-            // Send commands: DOM.enable then DOM.getDocument
             lws_callback_on_writable(wsi);
             break;
 
@@ -94,15 +121,15 @@ static int callback_cdp(struct lws *wsi, enum lws_callback_reasons reason,
             try {
                 auto j = json::parse(received_payload);
                 if (j.contains("result") && j["result"].contains("root")) {
-                    std::cout << "📦 DOM received, indexing clickable elements...\n";
+                    std::cout << "📦 DOM received. Indexing clickable elements...\n";
                     int index = 1;
                     traverse_dom(j["result"]["root"], index);
                     dom_received = true;
-                    lws_cancel_service(context);  // Close connection after DOM parse
+                    lws_cancel_service(context);
                 }
                 received_payload.clear();
             } catch (...) {
-                // Wait for more payload if it's partial
+                // wait for more fragments
             }
             break;
         }
@@ -124,18 +151,21 @@ static int callback_cdp(struct lws *wsi, enum lws_callback_reasons reason,
     return 0;
 }
 
-// Protocols list
+// Protocols
 static struct lws_protocols protocols[] = {
     {
-        "cdp-protocol",
-        callback_cdp,
-        0,
-        65536,
+        .name = "cdp-protocol",
+        .callback = callback_cdp,
+        .per_session_data_size = 0,
+        .rx_buffer_size = 65536,
+        .id = 0,
+        .user = nullptr,
+        .tx_packet_size = 0,
     },
-    { NULL, NULL, 0, 0 } // terminator
+    { nullptr, nullptr, 0, 0, 0, nullptr, 0 }
 };
 
-// Function to run the WebSocket client
+// WebSocket runner
 void run_websocket() {
     struct lws_context_creation_info info = {};
     info.port = CONTEXT_PORT_NO_LISTEN;
@@ -143,11 +173,10 @@ void run_websocket() {
 
     context = lws_create_context(&info);
     if (!context) {
-        std::cerr << "❌ Failed to create lws context\n";
+        std::cerr << "❌ Failed to create LWS context.\n";
         return;
     }
 
-    std::string full_url = "ws://localhost:9222" + WS_URL_PATH;
     struct lws_client_connect_info ccinfo = {};
     ccinfo.context = context;
     ccinfo.address = "localhost";
@@ -160,7 +189,7 @@ void run_websocket() {
 
     wsi_client = lws_client_connect_via_info(&ccinfo);
     if (!wsi_client) {
-        std::cerr << "❌ Failed to connect to WebSocket\n";
+        std::cerr << "❌ WebSocket connection failed.\n";
         return;
     }
 
@@ -169,4 +198,32 @@ void run_websocket() {
     }
 
     lws_context_destroy(context);
+}
+
+// Main function
+int main() {
+    std::cout << "🔍 Fetching WebSocket URL from Chrome...\n";
+
+    std::string ws_url = get_websocket_url_from_chrome();
+    if (ws_url.empty()) {
+        std::cerr << "❌ Could not retrieve WebSocket URL.\n";
+        return 1;
+    }
+
+    std::cout << "✅ WebSocket URL: " << ws_url << "\n";
+
+    std::size_t path_start = ws_url.find("/devtools/");
+    if (path_start == std::string::npos) {
+        std::cerr << "❌ Invalid WebSocket URL format.\n";
+        return 1;
+    }
+
+    WS_URL_PATH = ws_url.substr(path_start);
+    std::cout << "📎 Extracted WebSocket Path: " << WS_URL_PATH << "\n";
+
+    std::cout << "🚀 Starting WebSocket connection...\n";
+    run_websocket();
+
+    std::cout << "✅ Done.\n";
+    return 0;
 }
