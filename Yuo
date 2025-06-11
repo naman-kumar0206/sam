@@ -1,0 +1,14 @@
+if (j.contains("result")) {
+    std::cout << "✅ result found: " << j["result"].dump(2) << "\n";
+    
+    if (j["result"].is_object()) {
+        if (j["result"].contains("root")) {
+            std::cout << "🎯 root key exists inside result\n";
+            // proceed with traverse_dom...
+        } else {
+            std::cout << "❌ root key missing inside result\n";
+        }
+    } else {
+        std::cout << "❌ result is not an object\n";
+    }
+}
