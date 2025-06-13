@@ -1,57 +1,45 @@
- void traverse_dom_with_html(const json &node, int &index, std::ostream &out, int depth = 0) {
-    if (!node.contains("nodeName")) return;
+std::string get_indexed_html_dom(const json &node, int &index, int depth = 0) {
+    if (!node.contains("nodeName")) return "";
 
     std::string nodeName = node["nodeName"];
-    std::string tag = nodeName;
-    std::string indent(depth * 2, ' ');  // 2-space indentation
+    std::string indent(depth * 2, ' ');
+    std::string html;
 
-    // Start tag with attributes
-    out << indent << "<" << tag;
+    // Opening tag
+    html += indent + "<" + nodeName;
 
+    // Add attributes
     if (node.contains("attributes")) {
-        auto attrs = node["attributes"];
+        const auto &attrs = node["attributes"];
         for (size_t i = 0; i + 1 < attrs.size(); i += 2) {
             std::string key = attrs[i];
             std::string val = attrs[i + 1];
-            out << " " << key << "=\"" << val << "\"";
+            html += " " + key + "=\"" + val + "\"";
         }
     }
 
-    out << ">";
+    html += ">";
 
-    // Add inner text if available
-    if (node.contains("nodeValue") && !node["nodeValue"].is_null()) {
-        out << node["nodeValue"].get<std::string>();
+    // Add text if present
+    if (node.contains("nodeValue") && node["nodeValue"].is_string()) {
+        html += node["nodeValue"].get<std::string>();
     }
 
-    // Check if it's clickable
-    bool is_clickable = (tag == "A" || tag == "BUTTON" || tag == "INPUT");
-
-    if (is_clickable) {
-        out << "  <!-- [Clickable #" << index << "] -->";
-        index++;
+    // If clickable, add index comment
+    if (nodeName == "A" || nodeName == "BUTTON" || nodeName == "INPUT") {
+        html += "  <!-- [Clickable #" + std::to_string(index++) + "] -->";
     }
 
-    out << "\n";
+    html += "\n";
 
-    // Recurse children
+    // Children
     if (node.contains("children")) {
         for (const auto &child : node["children"]) {
-            traverse_dom_with_html(child, index, out, depth + 1);
+            html += get_indexed_html_dom(child, index, depth + 1);
         }
     }
 
-    // Close tag
-    out << indent << "</" << tag << ">\n";
+    // Closing tag
+    html += indent + "</" + nodeName + ">\n";
+    return html;
 }
-
-
-
-
-
-
-
-int index = 1;
-std::cout << "📜 Full HTML DOM with clickable indexing:\n\n";
-traverse_dom_with_html(j["result"]["root"], index, std::cout);
-
