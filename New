@@ -1,28 +1,65 @@
-case LWS_CALLBACK_CLIENT_RECEIVE: {
-    std::string response((const char*)in, len);
-    received_payload += response;
+std::string generate_html_from_dom(const json &node, int &index, int depth = 0) {
+    std::ostringstream out;
 
-    try {
-        if (json::accept(received_payload)) {
-            auto j = json::parse(received_payload);
-            
-            std::cout << "[✅ Full JSON Received]:\n" << j.dump(2) << "\n";
+    std::function<void(const json &, int)> traverse = [&](const json &node, int depth) {
+        if (!node.contains("nodeName")) return;
 
-            if (j.contains("result") && j["result"].contains("root")) {
-                std::cout << "📦 DOM received. Indexing clickable elements...\n";
-                int index = 1;
-                traverse_dom(j["result"]["root"], index);
-                dom_received = true;
-                lws_cancel_service(context);
+        std::string tag = node["nodeName"];
+        std::string indent(depth * 2, ' ');  // 2-space indentation
+
+        // Open tag
+        out << indent << "<" << tag;
+
+        if (node.contains("attributes")) {
+            auto attrs = node["attributes"];
+            for (size_t i = 0; i + 1 < attrs.size(); i += 2) {
+                std::string key = attrs[i];
+                std::string val = attrs[i + 1];
+                out << " " << key << "=\"" << val << "\"";
             }
-
-            received_payload.clear();
-        } else {
-            std::cout << "⏳ Waiting for full JSON (currently incomplete)...\n";
         }
-    } catch (const std::exception &e) {
-        std::cerr << "❌ JSON parse error: " << e.what() << "\n";
-        received_payload.clear();  // Optional: clear on error
-    }
-    break;
+
+        out << ">";
+
+        // Add text content if any
+        if (node.contains("nodeValue") && !node["nodeValue"].is_null()) {
+            out << node["nodeValue"].get<std::string>();
+        }
+
+        // If clickable
+        if (tag == "A" || tag == "BUTTON" || tag == "INPUT") {
+            out << "  <!-- [Clickable #" << index << "] -->";
+            index++;
+        }
+
+        out << "\n";
+
+        if (node.contains("children")) {
+            for (const auto &child : node["children"]) {
+                traverse(child, depth + 1);
+            }
+        }
+
+        out << indent << "</" << tag << ">\n";
+    };
+
+    traverse(node, depth);
+    return out.str();
 }
+
+
+
+
+
+if (j.contains("result") && j["result"].contains("root")) {
+    std::cout << "📦 DOM received. Indexing clickable elements...\n";
+    int index = 1;
+
+    // ✅ Generate HTML
+    std::string html = generate_html_from_dom(j["result"]["root"], index);
+    std::cout << html << "\n";  // or write to a file
+
+    dom_received = true;
+    lws_cancel_service(context);
+}
+
