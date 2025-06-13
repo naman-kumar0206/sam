@@ -1,0 +1,57 @@
+ void traverse_dom_with_html(const json &node, int &index, std::ostream &out, int depth = 0) {
+    if (!node.contains("nodeName")) return;
+
+    std::string nodeName = node["nodeName"];
+    std::string tag = nodeName;
+    std::string indent(depth * 2, ' ');  // 2-space indentation
+
+    // Start tag with attributes
+    out << indent << "<" << tag;
+
+    if (node.contains("attributes")) {
+        auto attrs = node["attributes"];
+        for (size_t i = 0; i + 1 < attrs.size(); i += 2) {
+            std::string key = attrs[i];
+            std::string val = attrs[i + 1];
+            out << " " << key << "=\"" << val << "\"";
+        }
+    }
+
+    out << ">";
+
+    // Add inner text if available
+    if (node.contains("nodeValue") && !node["nodeValue"].is_null()) {
+        out << node["nodeValue"].get<std::string>();
+    }
+
+    // Check if it's clickable
+    bool is_clickable = (tag == "A" || tag == "BUTTON" || tag == "INPUT");
+
+    if (is_clickable) {
+        out << "  <!-- [Clickable #" << index << "] -->";
+        index++;
+    }
+
+    out << "\n";
+
+    // Recurse children
+    if (node.contains("children")) {
+        for (const auto &child : node["children"]) {
+            traverse_dom_with_html(child, index, out, depth + 1);
+        }
+    }
+
+    // Close tag
+    out << indent << "</" << tag << ">\n";
+}
+
+
+
+
+
+
+
+int index = 1;
+std::cout << "📜 Full HTML DOM with clickable indexing:\n\n";
+traverse_dom_with_html(j["result"]["root"], index, std::cout);
+
