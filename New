@@ -1,46 +1,28 @@
-static int stage = 0;
-std::string msg;
+case LWS_CALLBACK_CLIENT_RECEIVE: {
+    std::string response((const char*)in, len);
+    received_payload += response;
 
-if (stage == 0) {
-    // Enable Runtime domain
-    msg = build_command(send_counter++, "Runtime.enable");
-} else if (stage == 1) {
-    // Evaluate JS to get full HTML string
-    json params = {
-        {"expression", "document.documentElement.outerHTML"},
-        {"returnByValue", true}
-    };
-    msg = build_command(send_counter++, "Runtime.evaluate", params);
-} else {
-    return -1;  // Done
-}
+    try {
+        if (json::accept(received_payload)) {
+            auto j = json::parse(received_payload);
+            
+            std::cout << "[✅ Full JSON Received]:\n" << j.dump(2) << "\n";
 
-stage++;
+            if (j.contains("result") && j["result"].contains("root")) {
+                std::cout << "📦 DOM received. Indexing clickable elements...\n";
+                int index = 1;
+                traverse_dom(j["result"]["root"], index);
+                dom_received = true;
+                lws_cancel_service(context);
+            }
 
-
-
-
-
-
-
-
-
-
-
-
-try {
-    auto j = json::parse(received_payload);
-    if (j.contains("result") && j["result"].contains("result") &&
-        j["result"]["result"].contains("value")) {
-        
-        std::string html = j["result"]["result"]["value"];
-        std::cout << "✅ Full HTML:\n" << html << "\n";
-
-        // Optional: You can index clickable elements here using regex or a parser.
-        dom_received = true;
-        lws_cancel_service(context);
+            received_payload.clear();
+        } else {
+            std::cout << "⏳ Waiting for full JSON (currently incomplete)...\n";
+        }
+    } catch (const std::exception &e) {
+        std::cerr << "❌ JSON parse error: " << e.what() << "\n";
+        received_payload.clear();  // Optional: clear on error
     }
-    received_payload.clear();
-} catch (...) {
-    // Waiting for more fragments
+    break;
 }
