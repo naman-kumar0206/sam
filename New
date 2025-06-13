@@ -1,45 +1,46 @@
-std::string get_indexed_html_dom(const json &node, int &index, int depth = 0) {
-    if (!node.contains("nodeName")) return "";
+static int stage = 0;
+std::string msg;
 
-    std::string nodeName = node["nodeName"];
-    std::string indent(depth * 2, ' ');
-    std::string html;
+if (stage == 0) {
+    // Enable Runtime domain
+    msg = build_command(send_counter++, "Runtime.enable");
+} else if (stage == 1) {
+    // Evaluate JS to get full HTML string
+    json params = {
+        {"expression", "document.documentElement.outerHTML"},
+        {"returnByValue", true}
+    };
+    msg = build_command(send_counter++, "Runtime.evaluate", params);
+} else {
+    return -1;  // Done
+}
 
-    // Opening tag
-    html += indent + "<" + nodeName;
+stage++;
 
-    // Add attributes
-    if (node.contains("attributes")) {
-        const auto &attrs = node["attributes"];
-        for (size_t i = 0; i + 1 < attrs.size(); i += 2) {
-            std::string key = attrs[i];
-            std::string val = attrs[i + 1];
-            html += " " + key + "=\"" + val + "\"";
-        }
+
+
+
+
+
+
+
+
+
+
+
+try {
+    auto j = json::parse(received_payload);
+    if (j.contains("result") && j["result"].contains("result") &&
+        j["result"]["result"].contains("value")) {
+        
+        std::string html = j["result"]["result"]["value"];
+        std::cout << "✅ Full HTML:\n" << html << "\n";
+
+        // Optional: You can index clickable elements here using regex or a parser.
+        dom_received = true;
+        lws_cancel_service(context);
     }
-
-    html += ">";
-
-    // Add text if present
-    if (node.contains("nodeValue") && node["nodeValue"].is_string()) {
-        html += node["nodeValue"].get<std::string>();
-    }
-
-    // If clickable, add index comment
-    if (nodeName == "A" || nodeName == "BUTTON" || nodeName == "INPUT") {
-        html += "  <!-- [Clickable #" + std::to_string(index++) + "] -->";
-    }
-
-    html += "\n";
-
-    // Children
-    if (node.contains("children")) {
-        for (const auto &child : node["children"]) {
-            html += get_indexed_html_dom(child, index, depth + 1);
-        }
-    }
-
-    // Closing tag
-    html += indent + "</" + nodeName + ">\n";
-    return html;
+    received_payload.clear();
+} catch (...) {
+    // Waiting for more fragments
 }
