@@ -210,3 +210,62 @@ int main() {
     std::cout << "✅ Done.\n";
     return 0;
 }
+
+
+
+
+
+
+
+
+
+#include <thread>       // Add this
+#include <chrono>       // Add this
+
+void run_websocket() {
+    struct lws_context_creation_info info = {};
+    info.port = CONTEXT_PORT_NO_LISTEN;
+    info.protocols = protocols;
+
+    context = lws_create_context(&info);
+    if (!context) {
+        std::cerr << "❌ Failed to create LWS context.\n";
+        return;
+    }
+
+    struct lws_client_connect_info ccinfo = {};
+    ccinfo.context = context;
+    ccinfo.address = "localhost";
+    ccinfo.port = 9222;
+    ccinfo.path = WS_URL_PATH.c_str();
+    ccinfo.host = lws_canonical_hostname(context);
+    ccinfo.origin = "origin";
+    ccinfo.protocol = protocols[0].name;
+    ccinfo.ssl_connection = 0;
+
+    wsi_client = lws_client_connect_via_info(&ccinfo);
+    if (!wsi_client) {
+        std::cerr << "❌ WebSocket connection failed.\n";
+        return;
+    }
+
+    // Start timeout thread
+    std::thread timeout_thread([]() {
+        std::this_thread::sleep_for(std::chrono::minutes(2));
+        std::cout << "⏰ Timeout reached. Closing WebSocket.\n";
+        dom_received = true;
+        if (context) {
+            lws_cancel_service(context);  // Interrupt lws_service
+        }
+    });
+
+    while (!dom_received) {
+        lws_service(context, 100);
+    }
+
+    timeout_thread.join();  // Wait for the thread to finish
+
+    lws_context_destroy(context);
+}
+
+
