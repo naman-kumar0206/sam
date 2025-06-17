@@ -1,0 +1,239 @@
+ #include <iostream>
+#include <string>
+#include <vector>
+#include <fstream>
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
+#include <boost/asio/connect.hpp>
+#include <boost/asio/ip/tcp.hpp>
+#include <nlohmann/json.hpp>
+#include <libwebsockets.h>
+#include <sstream>
+#include <algorithm>
+
+using json = nlohmann::json;
+using tcp = boost::asio::ip::tcp;
+namespace http = boost::beast::http;
+
+std::string WS_URL_PATH = "";
+static struct lws_context *context;
+static struct lws *wsi_client = nullptr;
+static std::string received_payload;
+static int send_counter = 1;
+static bool dom_received = false;
+
+// Utility to fetch WebSocket URL from localhost:9222/json
+std::string get_websocket_url_from_chrome() {
+    boost::asio::io_context ioc;
+    tcp::resolver resolver(ioc);
+    boost::beast::tcp_stream stream(ioc);
+
+    auto const results = resolver.resolve("localhost", "9222");
+    stream.connect(results);
+
+    http::request<http::string_body> req{http::verb::get, "/json", 11};
+    req.set(http::field::host, "localhost");
+    req.set(http::field::user_agent, BOOST_BEAST_VERSION_STRING);
+    http::write(stream, req);
+
+    boost::beast::flat_buffer buffer;
+    http::response<http::string_body> res;
+    http::read(stream, buffer, res);
+    stream.socket().shutdown(tcp::socket::shutdown_both);
+
+    json j = json::parse(res.body());
+    return j[0]["webSocketDebuggerUrl"];
+}
+
+// Send Chrome CDP command
+std::string build_command(int id, const std::string &method, const json &params = {}) {
+    json j;
+    j["id"] = id;
+    j["method"] = method;
+    if (!params.empty()) {
+        j["params"] = params;
+    }
+    return j.dump();
+}
+
+// Index clickable elements in the HTML
+std::string index_clickable_elements(const std::string& html, std::string& interactive_list) {
+    std::stringstream input(html);
+    std::stringstream output;
+    std::string line;
+    int index = 1;
+    std::vector<std::string> tags = {"button", "a", "input", "textarea", "select"};
+
+    while (std::getline(input, line)) {
+        std::string lower = line;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+
+        bool is_clickable = false;
+        for (const auto& tag : tags) {
+            if (lower.find("<" + tag) != std::string::npos) {
+                is_clickable = true;
+                break;
+            }
+        }
+
+        if (is_clickable) {
+            output << "[" << index << "]" << line << "\n";
+            interactive_list += "[" + std::to_string(index) + "]: " + line + "\n";
+            index++;
+        } else {
+            output << "[]" << line << "\n";
+        }
+    }
+
+    return output.str();
+}
+
+// WebSocket callback function
+static int callback_cdp(struct lws *wsi, enum lws_callback_reasons reason,
+                        void *user, void *in, size_t len) {
+    switch (reason) {
+        case LWS_CALLBACK_CLIENT_ESTABLISHED:
+            std::cout << "✅ WebSocket connection established.\n";
+            lws_callback_on_writable(wsi);
+            break;
+
+        case LWS_CALLBACK_CLIENT_WRITEABLE: {
+            json params = {
+                {"expression", "document.documentElement.outerHTML"}
+            };
+            std::string msg = build_command(send_counter++, "Runtime.evaluate", params);
+
+            std::vector<unsigned char> buf(LWS_PRE + msg.size());
+            std::memcpy(buf.data() + LWS_PRE, msg.c_str(), msg.size());
+            lws_write(wsi, buf.data() + LWS_PRE, msg.size(), LWS_WRITE_TEXT);
+            return 0;
+        }
+
+        case LWS_CALLBACK_CLIENT_RECEIVE: {
+            std::string response((const char*)in, len);
+            received_payload += response;
+
+            try {
+                auto j = json::parse(received_payload);
+                if (j.contains("result") && j["result"].contains("result") &&
+                    j["result"]["result"].contains("value")) {
+
+                    std::string html = j["result"]["result"]["value"];
+
+                    std::string interactive_list;
+                    std::string indexed_html = index_clickable_elements(html, interactive_list);
+
+                    std::cout << "\n📜 Indexed HTML:\n" << indexed_html;
+                    std::cout << "\n🧭 Interactive Elements:\n" << interactive_list;
+
+                    std::ofstream indexed("indexed_dom.html");
+                    indexed << indexed_html;
+                    indexed.close();
+
+                    std::ofstream list("clickables.txt");
+                    list << interactive_list;
+                    list.close();
+
+                    dom_received = true;
+                    lws_cancel_service(context);
+                }
+                received_payload.clear();
+            } catch (...) {
+                // wait for more parts
+            }
+            break;
+        }
+
+        case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
+            std::cerr << "❌ Connection error.\n";
+            dom_received = true;
+            break;
+
+        case LWS_CALLBACK_CLOSED:
+            std::cout << "🔒 Connection closed.\n";
+            dom_received = true;
+            break;
+
+        default:
+            break;
+    }
+
+    return 0;
+}
+
+// Protocols required for libwebsockets
+static struct lws_protocols protocols[] = {
+    {
+        .name = "cdp-protocol",
+        .callback = callback_cdp,
+        .per_session_data_size = 0,
+        .rx_buffer_size = 65536,
+        .id = 0,
+        .user = nullptr,
+        .tx_packet_size = 0,
+    },
+    { nullptr, nullptr, 0, 0, 0, nullptr, 0 }
+};
+
+// Runs the WebSocket event loop
+void run_websocket() {
+    struct lws_context_creation_info info = {};
+    info.port = CONTEXT_PORT_NO_LISTEN;
+    info.protocols = protocols;
+
+    context = lws_create_context(&info);
+    if (!context) {
+        std::cerr << "❌ Failed to create LWS context.\n";
+        return;
+    }
+
+    struct lws_client_connect_info ccinfo = {};
+    ccinfo.context = context;
+    ccinfo.address = "localhost";
+    ccinfo.port = 9222;
+    ccinfo.path = WS_URL_PATH.c_str();
+    ccinfo.host = lws_canonical_hostname(context);
+    ccinfo.origin = "origin";
+    ccinfo.protocol = protocols[0].name;
+    ccinfo.ssl_connection = 0;
+
+    wsi_client = lws_client_connect_via_info(&ccinfo);
+    if (!wsi_client) {
+        std::cerr << "❌ WebSocket connection failed.\n";
+        return;
+    }
+
+    while (!dom_received) {
+        lws_service(context, 100);
+    }
+
+    lws_context_destroy(context);
+}
+
+// Entry point
+int main() {
+    std::cout << "🔍 Fetching WebSocket URL from Chrome...\n";
+
+    std::string ws_url = get_websocket_url_from_chrome();
+    if (ws_url.empty()) {
+        std::cerr << "❌ Could not retrieve WebSocket URL.\n";
+        return 1;
+    }
+
+    std::cout << "✅ WebSocket URL: " << ws_url << "\n";
+
+    std::size_t path_start = ws_url.find("/devtools/");
+    if (path_start == std::string::npos) {
+        std::cerr << "❌ Invalid WebSocket URL format.\n";
+        return 1;
+    }
+
+    WS_URL_PATH = ws_url.substr(path_start);
+    std::cout << "📎 Extracted WebSocket Path: " << WS_URL_PATH << "\n";
+
+    std::cout << "🚀 Starting WebSocket connection...\n";
+    run_websocket();
+
+    std::cout << "✅ Done.\n";
+    return 0;
+}
