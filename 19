@@ -1,0 +1,211 @@
+ #include <iostream>
+#include <string>
+#include <vector>
+#include <fstream>
+#include <map>
+#include <algorithm>
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
+#include <boost/asio/connect.hpp>
+#include <boost/asio/ip/tcp.hpp>
+#include <nlohmann/json.hpp>
+#include <libwebsockets.h>
+#include <cstring>
+
+using json = nlohmann::json;
+using tcp = boost::asio::ip::tcp;
+namespace http = boost::beast::http;
+
+std::string WS_URL_PATH = "";
+static struct lws_context *context;
+static struct lws *wsi_client = nullptr;
+static std::string received_payload;
+static int send_counter = 1;
+static bool dom_received = false;
+static std::map<int, int> index_to_nodeId;
+static std::string extracted_html;
+static std::string interactive_list;
+
+std::string get_websocket_url_from_chrome() {
+    boost::asio::io_context ioc;
+    tcp::resolver resolver(ioc);
+    boost::beast::tcp_stream stream(ioc);
+    auto const results = resolver.resolve("localhost", "9222");
+    stream.connect(results);
+
+    http::request<http::string_body> req{http::verb::get, "/json", 11};
+    req.set(http::field::host, "localhost");
+    http::write(stream, req);
+
+    boost::beast::flat_buffer buffer;
+    http::response<http::string_body> res;
+    http::read(stream, buffer, res);
+    stream.socket().shutdown(tcp::socket::shutdown_both);
+
+    json j = json::parse(res.body());
+    return j[0]["webSocketDebuggerUrl"];
+}
+
+std::string build_command(int id, const std::string &method, const json &params = {}) {
+    json j;
+    j["id"] = id;
+    j["method"] = method;
+    if (!params.empty()) j["params"] = params;
+    return j.dump();
+}
+
+std::string index_clickable_elements(const std::string& html, std::string& interactive_list, std::map<int, int>& index_map, const json& dom_nodes) {
+    std::stringstream input(html);
+    std::stringstream output;
+    std::string line;
+    int index = 1;
+    std::vector<std::string> tags = {"button", "a", "input", "textarea", "select"};
+    int node_cursor = 0;
+
+    while (std::getline(input, line)) {
+        std::string lower = line;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        bool is_clickable = false;
+        std::string tag_found;
+
+        for (const auto& tag : tags) {
+            if (lower.find("<" + tag) != std::string::npos) {
+                is_clickable = true;
+                tag_found = tag;
+                break;
+            }
+        }
+
+        if (is_clickable) {
+            std::string modified_line = line;
+            size_t tag_pos = modified_line.find(">");
+            if (tag_pos != std::string::npos && tag_found != "input") {
+                modified_line.insert(tag_pos + 1, "[" + std::to_string(index) + "] ");
+            } else if (tag_found == "input") {
+                modified_line += " <!-- [" + std::to_string(index) + "] -->";
+            }
+
+            output << "[" << index << "]" << modified_line << "\n";
+            interactive_list += "[" + std::to_string(index) + "]: " + tag_found + " → nodeId: ";
+
+            while (node_cursor < dom_nodes.size()) {
+                std::string dom_tag = dom_nodes[node_cursor]["nodeName"];
+                std::transform(dom_tag.begin(), dom_tag.end(), dom_tag.begin(), ::tolower);
+                if (std::find(tags.begin(), tags.end(), dom_tag) != tags.end()) {
+                    int nodeId = dom_nodes[node_cursor]["nodeId"];
+                    index_map[index] = nodeId;
+                    interactive_list += std::to_string(nodeId) + "\n";
+                    node_cursor++;
+                    break;
+                }
+                node_cursor++;
+            }
+            index++;
+        } else {
+            output << "[]" << line << "\n";
+        }
+    }
+    return output.str();
+}
+
+static int callback_cdp(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len) {
+    static bool sent_eval = false, sent_dom = false;
+    static json dom_nodes;
+    switch (reason) {
+        case LWS_CALLBACK_CLIENT_ESTABLISHED:
+            lws_callback_on_writable(wsi);
+            break;
+
+        case LWS_CALLBACK_CLIENT_WRITEABLE: {
+            std::string msg;
+            if (!sent_eval) {
+                json params = {{"expression", "document.documentElement.outerHTML"}};
+                msg = build_command(send_counter++, "Runtime.evaluate", params);
+                sent_eval = true;
+            } else if (!sent_dom) {
+                msg = build_command(send_counter++, "DOM.getFlattenedDocument", { {"depth", -1}, {"pierce", true} });
+                sent_dom = true;
+            } else break;
+
+            std::vector<unsigned char> buf(LWS_PRE + msg.size());
+            std::memcpy(buf.data() + LWS_PRE, msg.c_str(), msg.size());
+            lws_write(wsi, buf.data() + LWS_PRE, msg.size(), LWS_WRITE_TEXT);
+            return 0;
+        }
+
+        case LWS_CALLBACK_CLIENT_RECEIVE: {
+            std::string response((const char*)in, len);
+            received_payload += response;
+            try {
+                auto j = json::parse(received_payload);
+                if (j.contains("result")) {
+                    if (j["result"].contains("result")) {
+                        extracted_html = j["result"]["result"]["value"];
+                    }
+                    if (j["result"].contains("nodes")) {
+                        dom_nodes = j["result"]["nodes"];
+                        std::string indexed_html = index_clickable_elements(extracted_html, interactive_list, index_to_nodeId, dom_nodes);
+                        std::ofstream out("indexed.html");
+                        out << indexed_html;
+                        out.close();
+
+                        std::ofstream log("interactives.txt");
+                        log << interactive_list;
+                        log.close();
+
+                        dom_received = true;
+                        lws_cancel_service(context);
+                    }
+            }
+            catch (...) {}
+            received_payload.clear();
+            break;
+        }
+
+        case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
+        case LWS_CALLBACK_CLOSED:
+            dom_received = true;
+            break;
+        default:
+            break;
+    }
+    return 0;
+}
+
+static struct lws_protocols protocols[] = {
+    { "cdp-protocol", callback_cdp, 0, 65536, 0, nullptr, 0 },
+    { nullptr, nullptr, 0, 0, 0, nullptr, 0 }
+};
+
+void run_websocket() {
+    struct lws_context_creation_info info = {};
+    info.port = CONTEXT_PORT_NO_LISTEN;
+    info.protocols = protocols;
+    context = lws_create_context(&info);
+    if (!context) return;
+
+    struct lws_client_connect_info ccinfo = {};
+    ccinfo.context = context;
+    ccinfo.address = "localhost";
+    ccinfo.port = 9222;
+    ccinfo.path = WS_URL_PATH.c_str();
+    ccinfo.host = lws_canonical_hostname(context);
+    ccinfo.origin = "origin";
+    ccinfo.protocol = protocols[0].name;
+    ccinfo.ssl_connection = 0;
+    wsi_client = lws_client_connect_via_info(&ccinfo);
+    if (!wsi_client) return;
+
+    while (!dom_received) {
+        lws_service(context, 100);
+    }
+    lws_context_destroy(context);
+}
+
+int main() {
+    std::string ws_url = get_websocket_url_from_chrome();
+    std::size_t path_start = ws_url.find("/devtools/");
+    WS_URL_PATH = ws_url.substr(path_start);
+    run_websocket();
+    return 0;
+}
