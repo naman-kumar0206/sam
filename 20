@@ -1,0 +1,152 @@
+// Compile with: g++ -o dom_click_mapper dom_click_mapper.cpp -lwebsockets -lssl -lcrypto -lz
+
+#include <libwebsockets.h>
+#include <nlohmann/json.hpp>
+#include <iostream>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#include <sstream>
+#include <cstring>
+
+using json = nlohmann::json;
+
+static struct lws_context *context;
+static struct lws *client_wsi;
+static int message_id = 1;
+static std::unordered_map<int, std::string> id_to_xpath;
+static std::unordered_map<int, int> id_to_nodeid;
+
+static std::string current_request;
+static std::string ws_path = "/devtools/page/REPLACE_WITH_TARGET_ID"; // Set this properly
+
+static void send_cdp_message(struct lws *wsi, const std::string &payload) {
+    std::string framed = payload;
+    unsigned char buf[LWS_PRE + 4096];
+    unsigned char *p = &buf[LWS_PRE];
+    size_t n = framed.length();
+    memcpy(p, framed.c_str(), n);
+    lws_write(wsi, p, n, LWS_WRITE_TEXT);
+}
+
+static std::string build_get_document_request() {
+    json req = {
+        {"id", message_id},
+        {"method", "DOM.getDocument"},
+        {"params", {{"depth", 3}, {"pierce", true}}}
+    };
+    return req.dump();
+}
+
+static std::string build_query_selector_all(int nodeId, const std::string &selector) {
+    json req = {
+        {"id", message_id},
+        {"method", "DOM.querySelectorAll"},
+        {"params", {{"nodeId", nodeId}, {"selector", selector}}}
+    };
+    return req.dump();
+}
+
+static std::string build_get_outer_html(int nodeId) {
+    json req = {
+        {"id", message_id},
+        {"method", "DOM.getOuterHTML"},
+        {"params", {{"nodeId", nodeId}}}
+    };
+    return req.dump();
+}
+
+static int callback_cdp(struct lws *wsi, enum lws_callback_reasons reason,
+                        void *user, void *in, size_t len) {
+    switch (reason) {
+        case LWS_CALLBACK_CLIENT_ESTABLISHED:
+            std::cout << "Connected to CDP\n";
+            current_request = build_get_document_request();
+            send_cdp_message(wsi, current_request);
+            break;
+
+        case LWS_CALLBACK_CLIENT_RECEIVE: {
+            std::string resp((const char*)in, len);
+            json msg = json::parse(resp);
+
+            if (msg.contains("id")) {
+                int id = msg["id"].get<int>();
+
+                if (msg.contains("result")) {
+                    if (msg["result"].contains("root")) {
+                        int doc_node_id = msg["result"]["root"]["nodeId"].get<int>();
+                        ++message_id;
+                        current_request = build_query_selector_all(doc_node_id, "a,button,input,textarea");
+                        send_cdp_message(wsi, current_request);
+                    } else if (msg["result"].contains("nodeIds")) {
+                        auto nodeIds = msg["result"]["nodeIds"];
+                        int index = 1;
+                        for (const auto &nid : nodeIds) {
+                            int node_id = nid.get<int>();
+                            id_to_nodeid[index] = node_id;
+                            ++message_id;
+                            current_request = build_get_outer_html(node_id);
+                            send_cdp_message(wsi, current_request);
+                            ++index;
+                        }
+                    } else if (msg["result"].contains("outerHTML")) {
+                        for (const auto &[idx, nid] : id_to_nodeid) {
+                            if (nid == msg["result"]["nodeId"]) {
+                                std::cout << "[" << idx << "] " << msg["result"]["outerHTML"].get<std::string>() << "\n";
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            break;
+        }
+
+        case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
+            std::cerr << "Connection failed\n";
+            break;
+
+        case LWS_CALLBACK_CLOSED:
+            std::cout << "Connection closed\n";
+            break;
+
+        default:
+            break;
+    }
+    return 0;
+}
+
+static struct lws_protocols protocols[] = {
+    {"cdp-protocol", callback_cdp, 0, 65536},
+    {NULL, NULL, 0, 0}
+};
+
+void run_client(const std::string &uri_path) {
+    struct lws_context_creation_info info;
+    memset(&info, 0, sizeof(info));
+    info.port = CONTEXT_PORT_NO_LISTEN;
+    info.protocols = protocols;
+    info.gid = -1;
+    info.uid = -1;
+    info.options |= LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
+    context = lws_create_context(&info);
+
+    struct lws_client_connect_info i;
+    memset(&i, 0, sizeof(i));
+    i.context = context;
+    i.address = "localhost";
+    i.port = 9222;
+    i.path = uri_path.c_str();
+    i.host = i.origin = "localhost:9222";
+    i.ssl_connection = 0;
+    i.protocol = protocols[0].name;
+
+    client_wsi = lws_client_connect_via_info(&i);
+    while (client_wsi && lws_service(context, 1000) >= 0);
+    lws_context_destroy(context);
+}
+
+int main() {
+    run_client(ws_path);
+    return 0;
+}
