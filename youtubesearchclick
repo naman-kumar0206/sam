@@ -1,0 +1,152 @@
+// YouTube Search & Click Automation Using C++ and libwebsockets
+// Make sure Chrome is started with:
+// chrome.exe --remote-debugging-port=9222 --user-data-dir="C:\\chrome-profile"
+
+#include <libwebsockets.h>
+#include <iostream>
+#include <string>
+#include <queue>
+#include <thread>
+#include <chrono>
+#include <nlohmann/json.hpp>
+#include <curl/curl.h>
+
+using json = nlohmann::json;
+
+std::queue<std::string> sendQueue;
+struct lws *g_wsi = nullptr;
+int message_id = 1;
+
+std::string fetchTargetWebSocketURL() {
+    CURL *curl = curl_easy_init();
+    std::string result;
+    if (curl) {
+        curl_easy_setopt(curl, CURLOPT_URL, "http://localhost:9222/json");
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, +[](char *ptr, size_t size, size_t nmemb, std::string *data) {
+            data->append(ptr, size * nmemb);
+            return size * nmemb;
+        });
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &result);
+        curl_easy_perform(curl);
+        curl_easy_cleanup(curl);
+    }
+    auto targets = json::parse(result);
+    std::string wsURL = targets[0]["webSocketDebuggerUrl"];
+    return wsURL;
+}
+
+void enqueueMessage(const json &msg) {
+    sendQueue.push(msg.dump());
+    if (g_wsi)
+        lws_callback_on_writable(g_wsi);
+}
+
+void sendSearchQuery(const std::string &query) {
+    json typeText = {
+        {"id", message_id++},
+        {"method", "Input.insertText"},
+        {"params", {{"text", query}}}
+    };
+    enqueueMessage(typeText);
+}
+
+int callback(struct lws *wsi, enum lws_callback_reasons reason,
+             void *user, void *in, size_t len) {
+    switch (reason) {
+    case LWS_CALLBACK_CLIENT_ESTABLISHED:
+        std::cout << "WebSocket connected.\n";
+
+        enqueueMessage({{"id", message_id++}, {"method", "Page.enable"}});
+        enqueueMessage({{"id", message_id++}, {"method", "DOM.enable"}});
+        enqueueMessage({{"id", message_id++}, {"method", "Runtime.enable"}});
+        enqueueMessage({{"id", message_id++}, {"method", "Input.enable"}});
+
+        enqueueMessage({{"id", message_id++}, {"method", "Page.navigate"},
+                        {"params", {{"url", "https://www.youtube.com"}}}});
+        break;
+
+    case LWS_CALLBACK_CLIENT_RECEIVE: {
+        std::string msg((const char *)in, len);
+        auto j = json::parse(msg);
+
+        // Wait for Page.loadEventFired then search
+        if (j.contains("method") && j["method"] == "Page.loadEventFired") {
+            std::cout << "Page loaded, querying search input...\n";
+
+            enqueueMessage({{"id", message_id++}, {"method", "DOM.getDocument"}});
+        }
+        if (j.contains("result") && j["result"].contains("root")) {
+            int rootNodeId = j["result"]["root"]["nodeId"];
+            enqueueMessage({{"id", message_id++}, {"method", "DOM.querySelector"},
+                            {"params", {{"nodeId", rootNodeId}, {"selector", "input#search"}}}});
+        }
+        if (j.contains("result") && j["result"].contains("nodeId") && j["id"] == 7) {
+            int searchBoxNodeId = j["result"]["nodeId"];
+
+            enqueueMessage({{"id", message_id++}, {"method", "DOM.focus"},
+                            {"params", {{"nodeId", searchBoxNodeId}}}});
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            sendSearchQuery("lofi beats");
+
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            enqueueMessage({{"id", message_id++}, {"method", "DOM.querySelector"},
+                            {"params", {{"nodeId", searchBoxNodeId}, {"selector", "button#search-icon-legacy"}}}});
+        }
+        // Click via JavaScript (you could also dispatchMouseEvent here if you compute x, y)
+        if (j.contains("id") && j["id"] == 10) {
+            enqueueMessage({{"id", message_id++},
+                            {"method", "Runtime.evaluate"},
+                            {"params", {{"expression",
+                                         "(function() { const b = document.querySelector('button#search-icon-legacy'); if(b) b.click(); })();"}}}});
+
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            enqueueMessage({{"id", message_id++},
+                            {"method", "Runtime.evaluate"},
+                            {"params", {{"expression",
+                                         "(function() { const f = document.querySelector('ytd-video-renderer a#thumbnail'); if(f) f.click(); })();"}}}});
+        }
+        break;
+    }
+
+    case LWS_CALLBACK_CLIENT_WRITEABLE:
+        if (!sendQueue.empty()) {
+            std::string out = sendQueue.front();
+            sendQueue.pop();
+            unsigned char buf[LWS_PRE + 4096];
+            size_t n = out.size();
+            memcpy(&buf[LWS_PRE], out.c_str(), n);
+            lws_write(wsi, &buf[LWS_PRE], n, LWS_WRITE_TEXT);
+        }
+        break;
+
+    case LWS_CALLBACK_CLOSED:
+        std::cout << "Connection closed\n";
+        break;
+    }
+    return 0;
+}
+
+int main() {
+    std::string wsUrl = fetchTargetWebSocketURL();
+    std::string path = wsUrl.substr(wsUrl.find("/devtools"));
+
+    struct lws_context_creation_info info = {};
+    info.port = CONTEXT_PORT_NO_LISTEN;
+    info.protocols = new lws_protocols[2]{{"cdp", callback, 0, 65536}, {nullptr, nullptr, 0, 0}};
+
+    struct lws_context *context = lws_create_context(&info);
+    struct lws_client_connect_info ccinfo = {};
+    ccinfo.context = context;
+    ccinfo.address = "localhost";
+    ccinfo.port = 9222;
+    ccinfo.path = path.c_str();
+    ccinfo.host = ccinfo.address;
+    ccinfo.origin = ccinfo.address;
+    ccinfo.protocol = "cdp";
+
+    g_wsi = lws_client_connect_via_info(&ccinfo);
+    while (g_wsi && lws_service(context, 1000) >= 0);
+    lws_context_destroy(context);
+
+    return 0;
+}
