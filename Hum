@@ -1,0 +1,79 @@
+ void scrollPage(struct lws* wsi, bool down) {
+    json msg = {
+        {"id", msg_id++},
+        {"method", "Runtime.evaluate"},
+        {"params", {
+            {"expression", down 
+                ? "window.scrollBy(0, window.innerHeight);"
+                : "window.scrollBy(0, -window.innerHeight);"},
+            {"returnByValue", false}
+        }}
+    };
+    sendCDPMessage(wsi, msg);
+}
+
+
+
+
+
+
+
+
+void openURL(struct lws* wsi, const std::string& url) {
+    json msg = {
+        {"id", msg_id++},
+        {"method", "Page.navigate"},
+        {"params", {
+            {"url", url}
+        }}
+    };
+    sendCDPMessage(wsi, msg);
+}
+
+
+
+
+
+
+
+
+void selectDropdownOption(struct lws* wsi, const std::string& objectId, const std::string& valueToSelect) {
+    json msg = {
+        {"id", msg_id++},
+        {"method", "Runtime.callFunctionOn"},
+        {"params", {
+            {"objectId", objectId},
+            {"functionDeclaration", std::string(R"(
+                function() {
+                    for (let i = 0; i < this.options.length; i++) {
+                        if (this.options[i].value === ')" + valueToSelect + R"(') {
+                            this.selectedIndex = i;
+                            this.dispatchEvent(new Event('change', { bubbles: true }));
+                            break;
+                        }
+                    }
+                }
+            )")},
+            {"returnByValue", false}
+        }}
+    };
+    sendCDPMessage(wsi, msg);
+}
+
+
+
+// Scroll down
+scrollPage(g_wsi, true);
+
+// Scroll up
+scrollPage(g_wsi, false);
+
+// Open YouTube
+openURL(g_wsi, "https://www.youtube.com");
+
+// Select "option2" from dropdown at index 5
+if (index_to_object_id.count(5)) {
+    selectDropdownOption(g_wsi, index_to_object_id[5], "option2");
+}
+
+
